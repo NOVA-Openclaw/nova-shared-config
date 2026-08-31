@@ -32,7 +32,7 @@ only ADDS newly-discovered models for the watched families; never deletes
 hand-maintained entries. Validates JSON, backs up, atomic writes, validates each
 peer config load.
 """
-import json, os, sys, shutil, tempfile, subprocess, urllib.request, urllib.error, glob
+import json, os, sys, shutil, tempfile, subprocess, urllib.request, urllib.error, urllib.parse, glob
 from datetime import datetime, timezone
 
 SHARED = "/opt/agents/shared-config/models-providers.json"
@@ -48,6 +48,7 @@ WATCH_PREFIXES = (
     "anthropic/claude-opus-", "anthropic/claude-sonnet-",
     "anthropic/claude-haiku-", "anthropic/claude-fable-",
     "openai/gpt-5", "x-ai/grok-4", "deepseek/deepseek-v",
+    "google/gemini-",
 )
 SKIP_SUFFIXES = (":batch", "-fast", ":free", ":thinking", ":extended")
 
@@ -55,17 +56,35 @@ SKIP_SUFFIXES = (":batch", "-fast", ":free", ":thinking", ":extended")
 # /models endpoint can be polled directly when its API key is in the environment.
 # env: the environment variable holding the key (convention: <PROVIDER>_API_KEY).
 # min_expected: alert floor — if a keyed provider yields fewer than this, warn.
+# style: "openai" (default) = OpenAI-compatible /models, Bearer auth, {"data":[{"id":...}]}.
+#        "gemini" = Google Generative Language: /models?key=..., NO Bearer, {"models":[{"name":"models/..."}]}.
+# openai (#187): OpenAI serves gpt-5.6-sol DIRECT but was absent from the registry AND
+# from this dict entirely, so every OpenAI model was silently assumed OpenRouter-only.
+# google (#187 second gap): had a baseUrl but was never direct-polled; Gemini's native
+# endpoint is a different shape (key-in-query, not Bearer), so it needs its own adapter.
 DIRECT_PROVIDERS = {
-    "moonshot": {"env": ("MOONSHOT_API_KEY", "KIMI_API_KEY"), "path": "/models", "min_expected": 2},
-    "deepseek": {"env": ("DEEPSEEK_API_KEY",),                "path": "/models", "min_expected": 1},
-    "xai":      {"env": ("XAI_API_KEY",),                     "path": "/models", "min_expected": 1},
-    "venice":   {"env": ("VENICE_API_KEY",),                  "path": "/models", "min_expected": 1},
+    "openai":   {"env": ("OPENAI_API_KEY",),                  "path": "/models", "min_expected": 5, "style": "openai"},
+    "moonshot": {"env": ("MOONSHOT_API_KEY", "KIMI_API_KEY"), "path": "/models", "min_expected": 2, "style": "openai"},
+    "deepseek": {"env": ("DEEPSEEK_API_KEY",),                "path": "/models", "min_expected": 1, "style": "openai"},
+    "xai":      {"env": ("XAI_API_KEY",),                     "path": "/models", "min_expected": 1, "style": "openai"},
+    "venice":   {"env": ("VENICE_API_KEY",),                  "path": "/models", "min_expected": 1, "style": "openai"},
+    "google":   {"env": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "path": "/models", "min_expected": 1, "style": "gemini"},
+}
+
+# Providers with a real remote catalog endpoint that are INTENTIONALLY not direct-polled,
+# with the reason. Used by the coverage manifest so "not in DIRECT_PROVIDERS" can be
+# distinguished as deliberate rather than an unnoticed gap (the #187 root cause: an
+# instrument silently under-reporting its own coverage).
+INTENTIONALLY_EXCLUDED = {
+    "openrouter": "primary source (fetched separately, not a 'direct' provider)",
+    "anthropic":  "direct entries are derived from OpenRouter data by design",
+    "ollama":     "local; no remote catalog to poll",
 }
 
 # Per-provider alert floors for the post-write verification pass. A provider
 # dropping below its floor (or to zero) is a loud failure, not a silent gap.
 MIN_MODELS = {
-    "openrouter": 5, "anthropic": 3, "moonshot": 2, "deepseek": 1,
+    "openrouter": 5, "anthropic": 3, "openai": 5, "moonshot": 2, "deepseek": 1,
     "xai": 1, "google": 1, "venice": 1,
 }
 
@@ -89,12 +108,36 @@ def _resolve_key(env_names):
 
 def fetch_direct(provider, base_url, cfg):
     """Fetch a provider's own /models list. Returns (model_ids, status).
-    status in {'ok','no_key','error'}. Never raises."""
+    status in {'ok','no_key','error'}. Never raises.
+
+    Two wire shapes (cfg['style']):
+      - 'openai' (default): OpenAI-compatible. Bearer auth; response {"data":[{"id":...}]}.
+      - 'gemini': Google Generative Language. Key in query (?key=...), NO Bearer;
+        response {"models":[{"name":"models/<id>"}]} — the id is the name minus the
+        "models/" prefix. Added for #187 (google gap): Gemini's native endpoint is
+        not OpenAI-compatible, so the generic path silently could never poll it.
+    """
     key = _resolve_key(cfg["env"])
     if not key:
         return [], "no_key"
-    url = base_url.rstrip("/") + cfg["path"]
+    style = cfg.get("style", "openai")
     try:
+        if style == "gemini":
+            url = base_url.rstrip("/") + cfg["path"] + "?key=" + urllib.parse.quote(key)
+            req = urllib.request.Request(url, headers={"User-Agent": "openclaw-catalog-refresh/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.load(r)
+            ids = []
+            for m in data.get("models", []):
+                if not isinstance(m, dict):
+                    continue
+                name = m.get("name") or m.get("id")
+                if not name:
+                    continue
+                ids.append(name.split("/", 1)[1] if name.startswith("models/") else name)
+            return ids, "ok"
+        # default: OpenAI-compatible
+        url = base_url.rstrip("/") + cfg["path"]
         req = urllib.request.Request(url, headers={
             "Authorization": f"Bearer {key}",
             "User-Agent": "openclaw-catalog-refresh/1.0",
@@ -104,7 +147,7 @@ def fetch_direct(provider, base_url, cfg):
         ids = [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
         return ids, "ok"
     except Exception as e:
-        warn(f"direct fetch failed for {provider} ({url}): {e}")
+        warn(f"direct fetch failed for {provider} ({style}, {base_url}): {e}")
         return [], "error"
 
 def ppm(pricing, key):
@@ -212,19 +255,29 @@ def main():
         warn(f"OpenRouter fetch failed: {e}")
 
     # --- Source 2: provider-direct /models (keyed providers only) ---
+    # coverage: per-provider what the direct-fetch pass actually DID this run, so
+    # "empty gaps" can never again be mistaken for "full coverage confirmed" (#187
+    # root cause: an instrument silently under-reporting its own scope). Values:
+    # 'checked' | 'skipped_no_key' | 'error' | 'no_baseurl'.
+    coverage = {}
     for prov, cfg in DIRECT_PROVIDERS.items():
         block = catalog.get(prov) or {}
         base = block.get("baseUrl")
         if not base:
+            coverage[prov] = "no_baseurl"
+            log(f"direct {prov}: NO baseUrl in registry — cannot direct-poll")
             continue
         ids, status = fetch_direct(prov, base, cfg)
         if status == "no_key":
+            coverage[prov] = "skipped_no_key"
             log(f"direct {prov}: SKIPPED (no key in env {cfg['env']}) — "
                 f"registry may be missing direct-only models until key is wired")
             continue
         if status == "error":
+            coverage[prov] = "error"
             log(f"direct {prov}: fetch error (see WARN above)")
             continue
+        coverage[prov] = "checked"
         log(f"direct {prov}: fetched {len(ids)} models")
         if len(ids) < cfg.get("min_expected", 1):
             warn(f"direct {prov}: only {len(ids)} models, expected >= {cfg['min_expected']}")
@@ -234,6 +287,23 @@ def main():
             log(f"direct {prov}: {len(new_ids)} model(s) NOT in curated registry "
                 f"(curator action needed to add with full specs): {', '.join(new_ids)}")
             direct_gaps.append((prov, new_ids))
+
+    # --- Coverage assert (#187): every provider block with a real remote /models
+    # endpoint (a baseUrl) MUST be either in DIRECT_PROVIDERS or explicitly listed in
+    # INTENTIONALLY_EXCLUDED. A provider with a catalog endpoint but no direct-fetch
+    # wiring is a silent coverage gap — the exact failure that hid openai/google. Warn
+    # loudly rather than pass over it; this is the durable fix, not just adding openai.
+    unwired = []
+    for prov, block in catalog.items():
+        if not isinstance(block, dict):
+            continue
+        if block.get("baseUrl") and prov not in DIRECT_PROVIDERS and prov not in INTENTIONALLY_EXCLUDED:
+            unwired.append(prov)
+    if unwired:
+        warn(f"COVERAGE GAP: provider(s) have a /models endpoint (baseUrl) but are NOT in "
+             f"DIRECT_PROVIDERS and NOT in INTENTIONALLY_EXCLUDED: {', '.join(sorted(unwired))}. "
+             f"They are silently assumed OpenRouter-only. Wire them into DIRECT_PROVIDERS or "
+             f"add them to INTENTIONALLY_EXCLUDED with a reason.")
 
     # --- Write path (only if something changed) ---
     if not added:
@@ -327,15 +397,30 @@ def main():
     # (including empty) so a prior run's gaps never persist as stale data. Failure
     # to write the artifact must not fail the run — it is advisory, not critical.
     try:
+        # coverage manifest (#187): distinguishes NOT-FOUND (checked, no new gaps) from
+        # NOT-CHECKED (skipped_no_key / error / no_baseurl / excluded). A consumer of
+        # this artifact must never read "gaps: {}" as "full coverage confirmed" without
+        # also reading coverage — that conflation is exactly what let openai/google hide.
         artifact = {
             "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "gaps": {prov: ids for prov, ids in direct_gaps},
+            "coverage": {
+                "checked":     sorted([p for p, s in coverage.items() if s == "checked"]),
+                "skipped_no_key": sorted([p for p, s in coverage.items() if s == "skipped_no_key"]),
+                "error":       sorted([p for p, s in coverage.items() if s == "error"]),
+                "no_baseurl":  sorted([p for p, s in coverage.items() if s == "no_baseurl"]),
+                "excluded":    sorted(list(INTENTIONALLY_EXCLUDED.keys())),
+                "unwired":     sorted(unwired),
+            },
         }
         atomic_write(GAPS_ARTIFACT, json.dumps(artifact, indent=2) + "\n",
                      0o640, "root", "agents")
         log(f"wrote gap artifact {GAPS_ARTIFACT} "
             f"({sum(len(v) for v in artifact['gaps'].values())} model(s) across "
-            f"{len(artifact['gaps'])} provider(s))")
+            f"{len(artifact['gaps'])} provider(s); "
+            f"checked={len(artifact['coverage']['checked'])} "
+            f"skipped={len(artifact['coverage']['skipped_no_key'])} "
+            f"unwired={len(artifact['coverage']['unwired'])})")
     except Exception as e:
         warn(f"failed to write gap artifact {GAPS_ARTIFACT}: {e}")
 
