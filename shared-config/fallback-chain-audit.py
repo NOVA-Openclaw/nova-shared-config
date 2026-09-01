@@ -34,6 +34,8 @@ Other traps encoded here:
 Usage:  python3 fallback-chain-audit.py [--db nova_memory] [--user graybeard]
 Exit 0 = all active chains conform; exit 1 = problems found.
 """
+import getpass
+import os
 import subprocess
 import sys
 
@@ -132,7 +134,13 @@ def audit(rows, reg, accept):
 
 
 def main():
-    db, user = "nova_memory", "graybeard"
+    # Default to the invoking identity so the script works for any agent with a
+    # .pgpass, not just a hardcoded user. --user remains an explicit override.
+    # (A hardcoded default user silently "works" only for the matching identity
+    # and fails exit>=2 for everyone else — that masks connection errors as
+    # chain defects under an alert-on-nonzero cron. See lesson on this.)
+    db = "nova_memory"
+    user = os.environ.get("PGUSER") or getpass.getuser()
     args = sys.argv[1:]
     for i, a in enumerate(args):
         if a == "--db" and i + 1 < len(args):
