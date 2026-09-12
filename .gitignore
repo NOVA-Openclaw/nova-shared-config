@@ -1,3 +1,26 @@
+# Python
 __pycache__/
 *.pyc
-.env
+
+# Secrets / credentials
+.env*
+secrets/
+credentials/
+*_token*
+*_secret*
+*.pem
+*.key
+
+# Logs
+*.log
+logs/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.swp
+*~
+.nova/
