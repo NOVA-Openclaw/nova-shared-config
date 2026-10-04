@@ -42,7 +42,7 @@ SHARED = "/opt/agents/shared-config/models-providers.json"
 # 0640 root:agents so all peers can read it (same access class as the catalog).
 GAPS_ARTIFACT = "/opt/agents/shared-config/direct-fetch-gaps.json"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
-PEERS = ["nova", "newhart", "graybeard"]
+PEERS = ["nova", "newhart", "graybeard", "victoria"]
 
 WATCH_PREFIXES = (
     "anthropic/claude-opus-", "anthropic/claude-sonnet-",
@@ -50,6 +50,25 @@ WATCH_PREFIXES = (
     "openai/gpt-5", "x-ai/grok-4", "deepseek/deepseek-v",
 )
 SKIP_SUFFIXES = (":batch", "-fast", ":free", ":thinking", ":extended")
+
+# Input modalities the OpenClaw gateway model-catalog schema accepts. The schema
+# enum is exactly {text, image, document} (ModelCatalogInput in
+# model-catalog-core). OpenRouter advertises richer modalities (audio, video) for
+# some models (e.g. xiaomi/mimo-v2.6-*), but the gateway cannot USE those inputs,
+# so carrying them in the catalog only produces a startup warning
+# ("Invalid models.json schema: providers.openrouter.models.N.input.K must be
+# equal to constant") without unlocking any real capability. We normalize
+# unsupported modalities out. If the gateway schema later gains audio/video,
+# add them here and the generator will stop stripping them.
+ALLOWED_INPUT_MODALITIES = ("text", "image", "document")
+
+# Providers that genuinely have NO cache pricing (local/free or no prompt cache),
+# where a missing cacheRead/cacheWrite legitimately means zero. For these we
+# default the fields to 0 so the catalog is complete. NOT listed here: moonshot,
+# xai, xiaomi -- those providers DO cache but simply do not PUBLISH a cache-write
+# price upstream (OpenRouter reports null). Unpublished is not zero; writing 0
+# there would understate cost, so we leave those fields ABSENT on purpose.
+NO_CACHE_PROVIDERS = ("venice", "ollama")
 
 # Provider-direct fetch config. Each keyed provider with an OpenAI-compatible
 # /models endpoint can be polled directly when its API key is in the environment.
@@ -113,9 +132,61 @@ def ppm(pricing, key):
     try: return round(float(v) * 1_000_000, 6)
     except (TypeError, ValueError): return 0
 
+def normalize_catalog(catalog):
+    """One-time, idempotent cleanup pass over EVERY existing model entry, run on
+    every invocation regardless of whether new models were added.
+
+    Two normalizations, both lossless with respect to real capability/pricing:
+
+    1. INPUT MODALITIES: drop any modality not in ALLOWED_INPUT_MODALITIES,
+       matching on the modality VALUE (not list position). The gateway schema
+       enum is {text, image, document}; audio/video entries (e.g. the curated
+       xiaomi/mimo-v2.6-* rows) produce a startup 'Invalid models.json schema'
+       warning and cannot be used by the gateway anyway, so stripping them loses
+       no real capability. If stripping would empty the list, fall back to
+       ['text'].
+
+    2. CACHE PRICING: for providers in NO_CACHE_PROVIDERS only (venice, ollama --
+       genuinely no prompt cache), default missing cost.cacheRead/cacheWrite to 0
+       so the entry is complete. For every OTHER provider a missing cache field
+       is left ABSENT: unpublished is not zero (moonshot/xai/xiaomi publish other
+       cache prices but not a cache-WRITE price), and writing 0 would understate
+       cost.
+
+    Idempotent: a second run finds nothing to change (already-clean modality
+    lists and already-present/correctly-absent cache fields). Returns a list of
+    human-readable change descriptions (empty if the catalog was already clean).
+    """
+    changes = []
+    for prov, blk in catalog.items():
+        if not isinstance(blk, dict):
+            continue
+        for m in blk.get("models", []) or []:
+            if not isinstance(m, dict):
+                continue
+            mid = f"{prov}/{m.get('id')}"
+            # (1) input modalities
+            ins = m.get("input")
+            if isinstance(ins, list):
+                kept = [x for x in ins if x in ALLOWED_INPUT_MODALITIES]
+                if not kept:
+                    kept = ["text"]
+                if kept != ins:
+                    changes.append(f"input {mid}: {ins} -> {kept}")
+                    m["input"] = kept
+            # (2) cache pricing -- only for genuinely no-cache providers
+            if prov in NO_CACHE_PROVIDERS:
+                cost = m.get("cost")
+                if isinstance(cost, dict):
+                    for fld in ("cacheRead", "cacheWrite"):
+                        if fld not in cost:
+                            cost[fld] = 0
+                            changes.append(f"cache {mid}: {fld} -> 0 (no-cache provider)")
+    return changes
+
 def or_entry(m):
     arch = m.get("architecture", {}) or {}
-    inputs = [x for x in (arch.get("input_modalities") or ["text"]) if x in ("text", "image")] or ["text"]
+    inputs = [x for x in (arch.get("input_modalities") or ["text"]) if x in ALLOWED_INPUT_MODALITIES] or ["text"]
     pricing = m.get("pricing", {}) or {}
     tp = m.get("top_provider", {}) or {}
     ctx = tp.get("context_length") or m.get("context_length") or 0
@@ -235,11 +306,27 @@ def main():
                 f"(curator action needed to add with full specs): {', '.join(new_ids)}")
             direct_gaps.append((prov, new_ids))
 
-    # --- Write path (only if something changed) ---
-    if not added:
-        log("no new models to add; catalog already current")
+    # --- Normalization pass (always; idempotent) ---
+    # Runs on EVERY invocation, independent of `added`, so hand-curated entries
+    # (which the merge path never regenerates) get schema-normalized too. Strips
+    # gateway-unsupported input modalities and 0-fills cache pricing only for
+    # genuinely no-cache providers. See normalize_catalog() for the full rationale.
+    norm_changes = normalize_catalog(catalog)
+    if norm_changes:
+        log(f"normalization: {len(norm_changes)} field(s) changed")
+        for c in norm_changes:
+            log(f"  normalize: {c}")
     else:
-        log(f"adding {len(added)} entries: {', '.join(added)}")
+        log("normalization: catalog already schema-clean")
+
+    # --- Write path (only if something changed) ---
+    if not added and not norm_changes:
+        log("no new models to add and catalog already schema-clean; nothing to write")
+    else:
+        if added:
+            log(f"adding {len(added)} entries: {', '.join(added)}")
+        if norm_changes:
+            log(f"writing {len(norm_changes)} normalization change(s)")
         new_str = json.dumps(catalog, indent=2); json.loads(new_str)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
