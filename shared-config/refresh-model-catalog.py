@@ -34,6 +34,16 @@ peer config load.
 """
 import json, os, sys, shutil, tempfile, subprocess, urllib.request, urllib.error, glob
 from datetime import datetime, timezone
+from pathlib import Path
+
+# Vendored nova-op helper; source of truth is nova-workspace:scripts/lib/nova_op_env.py
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+from lib.nova_op_env import (  # noqa: E402
+    MissingFromMapError,
+    NovaOpError,
+    resolve_first_present,
+)
 
 SHARED = "/opt/agents/shared-config/models-providers.json"
 # Machine-readable direct-fetch gap report consumed by Newhart's weekly fallback
@@ -80,18 +90,26 @@ def fetch_openrouter():
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)["data"]
 
-def _resolve_key(env_names):
-    for n in env_names:
-        v = os.environ.get(n)
-        if v:
-            return v
-    return None
-
 def fetch_direct(provider, base_url, cfg):
     """Fetch a provider's own /models list. Returns (model_ids, status).
-    status in {'ok','no_key','error'}. Never raises."""
-    key = _resolve_key(cfg["env"])
+    status in {'ok','no_key','error'}.
+
+    Key resolution rules:
+      - A provider is SKIPPED if none of its candidate env vars is mapped in
+        ~/.openclaw/scripts/nova-op-item-map.json (or the path in
+        NOVA_OP_ITEM_MAP). Optional providers stay partial-tolerant.
+      - A mapped key that fails to resolve (op error, timeout, placeholder) is
+        a LOUD error for that provider.
+      - An already-set environment value always wins without calling nova-op.
+    """
+    try:
+        key, attempted = resolve_first_present(cfg["env"])
+    except NovaOpError as exc:
+        warn(f"direct {provider}: key resolution failed ({exc})")
+        return [], "error"
     if not key:
+        log(f"direct {provider}: SKIPPED — no mapped key in item map "
+            f"(looked for {', '.join(attempted)})")
         return [], "no_key"
     url = base_url.rstrip("/") + cfg["path"]
     try:
