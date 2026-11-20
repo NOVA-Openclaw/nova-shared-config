@@ -206,6 +206,14 @@ def test_vendored_helper_matches_pinned_hash() -> None:
     """Vendored nova_op_env.py must match the pinned hash in VENDORED.json."""
     import hashlib
 
+    def body_hash(path: Path) -> str:
+        lines = []
+        for line in path.read_text().splitlines():
+            stripped = line.lstrip()
+            if stripped and not stripped.startswith("#"):
+                lines.append(line)
+        return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
     file_path = REPO_ROOT / "shared-config" / "lib" / "nova_op_env.py"
     meta_file = REPO_ROOT / "shared-config" / "lib" / "nova_op_env.py.VENDORED.json"
     assert file_path.exists()
@@ -213,8 +221,12 @@ def test_vendored_helper_matches_pinned_hash() -> None:
 
     meta = json.loads(meta_file.read_text())
     actual_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+    actual_body_hash = body_hash(file_path)
     assert meta["sha256"] == actual_hash, (
-        f"nova_op_env.py hash mismatch: expected {meta['sha256']}, got {actual_hash}"
+        f"nova_op_env.py full hash mismatch: expected {meta['sha256']}, got {actual_hash}"
+    )
+    assert meta["source_body_sha256"] == actual_body_hash, (
+        f"nova_op_env.py body hash mismatch: expected {meta['source_body_sha256']}, got {actual_body_hash}"
     )
     assert meta["source_repo"] == "NOVA-Openclaw/nova-workspace"
     assert meta["source_path"] == "scripts/lib/nova_op_env.py"
