@@ -27,8 +27,17 @@ artifact, not the source.**
 
 ## Secrets
 
-- These scripts read provider API keys from the **environment** (`<PROVIDER>_API_KEY`),
-  never from embedded literals. Keep it that way — no baked credentials in repo.
+- **Resolution order (SecretRef migration, nova-workspace#309):** `refresh-model-catalog.py`
+  resolves each provider's API key via `resolve_first_present()` (vendored from
+  `nova-workspace:scripts/lib/nova_op_env.py`): an already-set environment
+  variable (`<PROVIDER>_API_KEY`) always wins without calling `nova-op`;
+  otherwise the key is looked up by item ID in the per-agent item map
+  (`~/.openclaw/scripts/nova-op-item-map.json`, override path via
+  `NOVA_OP_ITEM_MAP`). A provider with no mapped env var is **skipped**
+  (logged, not an error — optional providers stay partial-tolerant); a provider
+  whose env var *is* mapped but fails to resolve (`op` error, timeout,
+  placeholder item/vault ID) is a **loud, logged error** for that provider.
+  Never embed credentials as literals in this repo.
 - **`models-providers.json` is NOT a repo file.** It carries live `apiKey` values
   and is a deployed-runtime artifact maintained by `refresh-model-catalog.py`.
   The installer never creates or overwrites it and preserves its `640 root:agents`
